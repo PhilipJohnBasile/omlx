@@ -546,6 +546,7 @@ class EngineCore:
         specprefill_system_end: Optional[int] = None,
         skip_cache_store: bool = False,
         tools: list[dict[str, Any]] | None = None,
+        semantic_hint_candidate: Any = None,
     ) -> str:
         """
         Add a request for processing.
@@ -585,6 +586,7 @@ class EngineCore:
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=skip_cache_store,
+            semantic_hint_candidate=semantic_hint_candidate,
         )
 
         # SpecPrefill: resolve per-request settings.
@@ -635,6 +637,12 @@ class EngineCore:
             # would show it as "Generating" indefinitely (#1154).
             # Drop the tracking and abort any partial scheduler insert (the
             # deferred abort is idempotent and harmless if it never landed).
+            semantic_hint_context = getattr(request, "semantic_hint_context", None)
+            if semantic_hint_context is not None:
+                with suppress(Exception):
+                    semantic_hint_context.cancel()
+                request.semantic_hint_context = None
+            request.semantic_hint_candidate = None
             try:
                 self.scheduler.abort_request(request_id)
             except Exception as abort_exc:  # noqa: BLE001
