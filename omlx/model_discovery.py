@@ -26,7 +26,7 @@ from typing import Literal
 logger = logging.getLogger(__name__)
 
 ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "external_gguf"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -395,7 +395,7 @@ def _is_unsupported_model(model_path: Path) -> bool:
     try:
         with open(config_path) as f:
             config = json.load(f)
-    except (json.JSONDecodeError, IOError):
+    except (OSError, json.JSONDecodeError):
         return False
 
     architectures = config.get("architectures", [])
@@ -449,7 +449,7 @@ def _has_sentence_transformers_embedding_pipeline(model_path: Path) -> bool:
     try:
         with open(modules_path) as f:
             modules = json.load(f)
-    except (json.JSONDecodeError, IOError):
+    except (OSError, json.JSONDecodeError):
         return False
 
     if not isinstance(modules, list):
@@ -595,7 +595,7 @@ def detect_model_type(model_path: Path) -> ModelType:
     try:
         with open(config_path) as f:
             config = json.load(f)
-    except (json.JSONDecodeError, IOError):
+    except (OSError, json.JSONDecodeError):
         return "llm"
 
     # Check architectures field for reranker first (more specific)
@@ -1301,6 +1301,29 @@ def _register_model(
             logger.info(f"Skipping unsupported model: {model_id}")
             return
 
+        # Direct .gguf file: an external-engine artifact (e.g. DS4/DwarfStar
+        # DeepSeek V4 GGUFs). oMLX does not load it into MLX; the server
+        # spawns ds4-server and proxies to it.
+        if isinstance(model_dir, Path) and model_dir.is_file() and (
+            model_dir.suffix.lower() == ".gguf"
+        ):
+            size = model_dir.stat().st_size if model_dir.exists() else 0
+            models[model_id] = DiscoveredModel(
+                model_id=model_id,
+                model_path=str(model_dir),
+                model_type="llm",
+                engine_type="external_gguf",
+                estimated_size=size,
+                config_model_type="external_gguf",
+                source_type=source_type,
+                source_repo_id=source_repo_id,
+            )
+            logger.info(
+                f"Registered external GGUF model: {model_id} "
+                f"({size / 2**30:.1f} GiB)"
+            )
+            return
+
         model_type = detect_model_type(model_dir)
         if model_type == "embedding":
             engine_type: EngineType = "embedding"
@@ -1409,6 +1432,15 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
     models: dict[str, DiscoveredModel] = {}
 
     for subdir in _iter_readable_entries(model_dir, "model directory"):
+        # A direct .gguf file is an external-engine model (DS4/DwarfStar).
+        if subdir.is_file() and subdir.suffix.lower() == ".gguf":
+            _register_model(
+                models,
+                subdir,
+                subdir.stem,
+                source_type="external_gguf",
+            )
+            continue
         if not _is_readable_dir(subdir, "model entry") or subdir.name.startswith("."):
             continue
 

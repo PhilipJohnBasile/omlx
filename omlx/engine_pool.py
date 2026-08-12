@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 import mlx.core as mx
 
+from .dflash_runtime import normalize_dflash_copyspec_mode
 from .engine import BaseEngine, BatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -48,6 +49,9 @@ from .exceptions import (
 )
 from .model_discovery import discover_models, format_size
 from .scheduler import SchedulerConfig
+from .speculative.exactness_policy import (
+    speculative_verification_block_reason_from_path,
+)
 from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
@@ -389,6 +393,10 @@ class EnginePool:
             add("dflash_draft_window_size", data.get("dflash_draft_window_size"))
             add("dflash_draft_sink_size", data.get("dflash_draft_sink_size"))
             add("dflash_verify_mode", data.get("dflash_verify_mode"))
+            add(
+                "dflash_copyspec_mode",
+                normalize_dflash_copyspec_mode(data.get("dflash_copyspec_mode")),
+            )
 
         vlm_mtp_active = bool(data.get("vlm_mtp_enabled", False)) and has_value(
             "vlm_mtp_draft_model"
@@ -518,7 +526,7 @@ class EnginePool:
         return model_type == "diffusion_gemma"
 
     def apply_settings_overrides(
-        self, settings_manager: "ModelSettingsManager"
+        self, settings_manager: ModelSettingsManager
     ) -> None:
         """Apply model_type_override from persisted settings to discovered entries."""
         for model_id, entry in self._entries.items():
@@ -1801,6 +1809,16 @@ class EnginePool:
                         model_name=entry.model_path,
                         config_model_type=entry.config_model_type,
                     )
+                elif entry.engine_type == "external_gguf":
+                    from .engine.external_gguf import ExternalGGUFEngine
+
+                    engine = ExternalGGUFEngine(
+                        model_path=entry.model_path,
+                        context_window=getattr(
+                            self._scheduler_config, "max_seq_len", 32768
+                        )
+                        or 32768,
+                    )
                 else:
                     engine = BatchedEngine(
                         model_name=entry.model_path,
@@ -1970,11 +1988,15 @@ class EnginePool:
 
             # VLM MTP: load MTP drafter (gemma4_assistant or qwen3_5_mtp) and attach to engine.
             # Fail-soft -- drafter load issues never block the target engine.
+            vlm_mtp_block_reason = speculative_verification_block_reason_from_path(
+                entry.model_path
+            )
             if (
                 model_settings is not None
                 and getattr(model_settings, "vlm_mtp_enabled", False)
                 and getattr(model_settings, "vlm_mtp_draft_model", None)
                 and hasattr(engine, "set_vlm_mtp_drafter")
+                and vlm_mtp_block_reason is None
             ):
                 drafter_id = model_settings.vlm_mtp_draft_model
                 drafter_entry = self._entries.get(drafter_id)
@@ -2004,6 +2026,17 @@ class EnginePool:
                         f"VLM MTP toggle on for {model_id} but drafter "
                         f"load failed; toggle ignored"
                     )
+            elif (
+                model_settings is not None
+                and getattr(model_settings, "vlm_mtp_enabled", False)
+                and getattr(model_settings, "vlm_mtp_draft_model", None)
+                and vlm_mtp_block_reason is not None
+            ):
+                logger.warning(
+                    "VLM MTP disabled for %s: %s",
+                    model_id,
+                    vlm_mtp_block_reason,
+                )
 
             # Keep the requested construction variant as the reuse key. DFlash
             # and VLM MTP are fail-soft: either can leave a normal engine in

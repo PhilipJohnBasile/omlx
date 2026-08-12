@@ -485,9 +485,25 @@ def maybe_apply_pre_load_patches(
     # the resulting model is indistinguishable from a stock model that
     # never had MTP heads.
     if _is_mtp_compatible(config, model_type):
-        mtp_enabled = bool(
+        requested_mtp = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
         )
+        from ..speculative.exactness_policy import (
+            qwen36_affine_q8_g64_speculative_block_reason,
+        )
+
+        mtp_block_reason = (
+            qwen36_affine_q8_g64_speculative_block_reason(config)
+            if requested_mtp
+            else None
+        )
+        mtp_enabled = requested_mtp and mtp_block_reason is None
+        if mtp_block_reason is not None:
+            logger.warning(
+                "Native MTP disabled for %s: %s",
+                model_name,
+                mtp_block_reason,
+            )
         from ..patches.mlx_lm_mtp import (
             apply_mlx_lm_mtp_patch,
             set_mtp_active,

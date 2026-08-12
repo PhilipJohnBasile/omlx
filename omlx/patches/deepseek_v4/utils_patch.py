@@ -35,6 +35,10 @@ import mlx.nn as nn
 import mlx_lm.utils as _utils
 from mlx.utils import tree_map
 
+from .ratio128_policy import (
+    native_ratio128_attention_enabled as _native_ratio128_attention_enabled,
+)
+
 logger = logging.getLogger(__name__)
 
 SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
@@ -145,6 +149,11 @@ def _build_patched_load_model() -> Callable:
             text_config = config.get("text_config", {})
             if "quantization_config" in text_config:
                 config["quantization_config"] = text_config["quantization_config"]
+
+        if str(config.get("model_type", "")).startswith("deepseek_v4"):
+            config["use_native_ratio128_attention"] = bool(
+                config.get("use_native_ratio128_attention", True)
+            ) and _native_ratio128_attention_enabled(config)
 
         model_args = model_args_class.from_dict(config)
         model = model_class(model_args)

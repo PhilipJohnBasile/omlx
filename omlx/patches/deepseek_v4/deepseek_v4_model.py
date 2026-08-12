@@ -11,22 +11,26 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx.utils import tree_flatten
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import CacheList, PoolingCache, RotatingKVCache
-from .hyper_connection import HyperConnection, HyperHead, hc_expand
-from .mla import MultiLinear
-from .pipeline import PipelineMixin
-from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
 from omlx.patches.deepseek_v4.decode_consistency import (
     is_armed as is_dspark_verify_armed,
 )
 from omlx.patches.deepseek_v4.decode_consistency import matmul as decode_matmul
+from omlx.patches.deepseek_v4.ratio128_policy import (
+    should_attempt_native_ratio128_attention,
+)
+from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
 from omlx.patches.deepseek_v4.verify_attention import (
     exact_attention,
     exact_local_scores,
     exact_local_values,
     rowwise_gemm,
 )
+
+from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import CacheList, PoolingCache, RotatingKVCache
+from .hyper_connection import HyperConnection, HyperHead, hc_expand
+from .mla import MultiLinear
+from .pipeline import PipelineMixin
 
 _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = False
 _DEEPSEEK_V4_INDEXER_NATIVE_DISABLED = False
@@ -165,6 +169,7 @@ class ModelArgs(BaseModelArgs):
     n_mtp_layers: int = 0
     tie_word_embeddings: bool = False
     topk_method: str = "noaux_tc"
+    use_native_ratio128_attention: bool = True
 
     def __post_init__(self):
         if not self.compress_ratios:
@@ -607,6 +612,21 @@ def _sparse_pooled_ring_attention(
     ).astype(q.dtype)
 
 
+def _native_sparse_attention_available() -> bool:
+    """Return whether ratio-128 dispatch may attempt the native kernel."""
+    global _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
+
+    if _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED:
+        return False
+    try:
+        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+
+        return glm_fast.has_symbol("deepseek_v4_sparse_attention")
+    except Exception:
+        _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
+        return False
+
+
 def _sparse_pooled_attention(
     q: mx.array,
     local_kv: mx.array,
@@ -620,7 +640,8 @@ def _sparse_pooled_attention(
     compress_ratio: Optional[int] = None,
     local_window: Optional[int] = None,
     decode_consistent: bool = False,
-) -> mx.array:
+    native_only: bool = False,
+) -> Optional[mx.array]:
     global _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
 
     B, H, L, D = q.shape
@@ -661,6 +682,9 @@ def _sparse_pooled_attention(
                 )
         except Exception:
             _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
+
+    if native_only:
+        return None
 
     idx = topk[:, None, :, :, None]
     pooled = mx.take_along_axis(
@@ -1550,6 +1574,8 @@ class CompressedAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        *,
+        _standard_mask: bool = False,
     ) -> mx.array:
         B, L, _ = x.shape
         local_cache = cache[0] if cache is not None else None
@@ -1598,21 +1624,56 @@ class CompressedAttention(nn.Module):
             pooled_mask = (
                 pool_cache.make_mask(L, offset) if pool_cache is not None else None
             )
-        if pooled.shape[1] > 0:
-            kv = mx.concatenate([kv, pooled[:, None]], axis=2)
-        mask = _extend_mask(mask, pooled_mask, kv.shape[2])
-        if self.dspark and B == 1 and L == 1:
-            out = exact_attention(q, [kv], self.scale, sinks)
-        else:
-            out = scaled_dot_product_attention(
+        # The native kernel reconstructs the model's causal/sliding masks
+        # from offsets; direct callers with custom masks stay on dense SDPA.
+        out = None
+        if (
+            should_attempt_native_ratio128_attention(
+                enabled=self.config.use_native_ratio128_attention,
+                compress_ratio=self.compress_ratio,
+                standard_mask=_standard_mask,
+                has_pooled_rows=pooled.shape[1] > 0,
+                query_length=L,
+                scalar_cache_offset=not isinstance(offset, mx.array),
+                dspark_single_token_decode=self.dspark and B == 1 and L == 1,
+            )
+            and _native_sparse_attention_available()
+        ):
+            pooled_indices = mx.broadcast_to(
+                mx.arange(pooled.shape[1], dtype=mx.uint32)[None, None],
+                (B, L, pooled.shape[1]),
+            )
+            out = _sparse_pooled_attention(
                 q,
                 kv,
-                kv,
-                cache=local_cache,
-                scale=self.scale,
-                mask=mask,
-                sinks=sinks,
+                pooled,
+                pooled_indices,
+                mask,
+                pooled_mask,
+                self.scale,
+                sinks,
+                q_offset=offset,
+                compress_ratio=self.compress_ratio,
+                local_window=self.config.sliding_window,
+                decode_consistent=self.dspark,
+                native_only=True,
             )
+        if out is None:
+            if pooled.shape[1] > 0:
+                kv = mx.concatenate([kv, pooled[:, None]], axis=2)
+            mask = _extend_mask(mask, pooled_mask, kv.shape[2])
+            if self.dspark and B == 1 and L == 1:
+                out = exact_attention(q, [kv], self.scale, sinks)
+            else:
+                out = scaled_dot_product_attention(
+                    q,
+                    kv,
+                    kv,
+                    cache=local_cache,
+                    scale=self.scale,
+                    mask=mask,
+                    sinks=sinks,
+                )
         out = _project_attention_output(self, out, offset)
 
         if self.sharding_group is not None:
@@ -1893,10 +1954,21 @@ class DeepseekV4Block(nn.Module):
         mask: Optional[mx.array],
         cache: Optional[Any],
         input_ids: mx.array,
+        *,
+        _standard_mask: bool = False,
     ) -> mx.array:
         residual = h
         x, post, comb = self.attn_hc(h)
-        x = self.attn(self.attn_norm(x), mask=mask, cache=cache)
+        attn_input = self.attn_norm(x)
+        if isinstance(self.attn, CompressedAttention):
+            x = self.attn(
+                attn_input,
+                mask=mask,
+                cache=cache,
+                _standard_mask=_standard_mask,
+            )
+        else:
+            x = self.attn(attn_input, mask=mask, cache=cache)
         h = hc_expand(x, residual, post, comb)
 
         residual = h
@@ -1947,7 +2019,8 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
         for layer, layer_cache in zip(self.pipeline_layers, cache):
-            h = layer(h, mask, layer_cache, inputs)
+            # This mask was created above from the model's own cache/window.
+            h = layer(h, mask, layer_cache, inputs, _standard_mask=True)
 
         _materialize_cache_arrays(cache)
 

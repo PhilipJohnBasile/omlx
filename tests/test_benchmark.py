@@ -998,6 +998,13 @@ class TestFilterUploadedSettings:
         )
         assert out["dflash_draft_model"] == "Qwen3-0.6B-4bit"
 
+    def test_dflash_copyspec_mode_is_kept_in_benchmark_receipts(self):
+        out = _filter_uploaded_settings(
+            self._settings(dflash_enabled=True, dflash_copyspec_mode="auto")
+        )
+
+        assert out["dflash_copyspec_mode"] == "auto"
+
     def test_bare_draft_model_name_is_unchanged(self):
         out = _filter_uploaded_settings(
             self._settings(

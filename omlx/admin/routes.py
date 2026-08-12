@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field, field_validator
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
 from ..api.utils import _try_parse_json
+from ..dflash_runtime import normalize_dflash_copyspec_mode
 from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..model_settings import merge_chat_template_kwargs
 from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
@@ -148,6 +149,7 @@ class ModelSettingsRequest(BaseModel):
     dflash_draft_window_size: int | None = None
     dflash_draft_sink_size: int | None = None
     dflash_verify_mode: str | None = None
+    dflash_copyspec_mode: str | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
     # VLM MTP speculative decoding via external assistant drafter (mlx-vlm 191d7c8+)
@@ -506,6 +508,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         "dflash_draft_window_size",
         "dflash_draft_sink_size",
         "dflash_verify_mode",
+        "dflash_copyspec_mode",
         "vlm_mtp_draft_model",
         "vlm_mtp_draft_block_size",
     )
@@ -612,6 +615,7 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.dflash_draft_window_size = None
     settings.dflash_draft_sink_size = None
     settings.dflash_verify_mode = None
+    settings.dflash_copyspec_mode = None
     settings.mtp_enabled = False
     settings.vlm_mtp_enabled = False
     settings.vlm_mtp_draft_model = None
@@ -2394,6 +2398,12 @@ async def update_model_settings(
         current_settings.dflash_verify_mode = (
             value if value in ("dflash", "adaptive", "ddtree", "off") else None
         )
+    if "dflash_copyspec_mode" in sent:
+        # Unsupported values (including an empty string) revert to the
+        # dflash-mlx default rather than making model load fail.
+        current_settings.dflash_copyspec_mode = normalize_dflash_copyspec_mode(
+            request.dflash_copyspec_mode
+        )
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     if "mtp_enabled" in sent:
@@ -2616,6 +2626,10 @@ async def update_model_settings(
         or "dflash_in_memory_cache" in sent
         or "dflash_in_memory_cache_max_entries" in sent
         or "dflash_in_memory_cache_max_bytes" in sent
+        or "dflash_draft_window_size" in sent
+        or "dflash_draft_sink_size" in sent
+        or "dflash_verify_mode" in sent
+        or "dflash_copyspec_mode" in sent
         or "dflash_ssd_cache" in sent
         or "dflash_ssd_cache_max_bytes" in sent
         # trust_remote_code is plumbed at model load time; toggling it on

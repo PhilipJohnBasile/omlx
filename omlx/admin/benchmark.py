@@ -320,6 +320,7 @@ _UPLOADED_SETTING_FIELDS = (
     "dflash_draft_window_size",
     "dflash_draft_sink_size",
     "dflash_verify_mode",
+    "dflash_copyspec_mode",
     "mtp_enabled",
     "mtp_num_draft_tokens",
     "vlm_mtp_enabled",

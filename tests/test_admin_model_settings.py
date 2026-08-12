@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for load-failure invalidation in admin model settings."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -98,3 +98,27 @@ async def test_sampling_setting_change_keeps_cached_failure():
     assert entry.load_failed is True
     assert entry.load_failure_message == "trust_remote_code=True required"
     assert entry.load_failure_at == 123.0
+
+
+@pytest.mark.asyncio
+async def test_copyspec_change_clears_failure_and_reloads_loaded_dflash_engine():
+    pool, entry = _failed_pool()
+    entry.engine = MagicMock()
+    pool._unload_engine = AsyncMock()
+    settings = ModelSettings(
+        dflash_enabled=True,
+        dflash_draft_model="/draft",
+        dflash_copyspec_mode="conservative",
+    )
+
+    result = await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(dflash_copyspec_mode="auto"),
+    )
+
+    assert settings.dflash_copyspec_mode == "auto"
+    assert entry.load_failed is False
+    assert result["requires_reload"] is True
+    assert result["auto_unloaded"] is True
+    pool._unload_engine.assert_awaited_once_with("ling")

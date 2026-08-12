@@ -501,6 +501,26 @@ def test_record_chunk_transient_skips_tail_samples():
     assert tracker.last_delta_bytes == 32 * 1024**2
 
 
+def test_record_chunk_transient_ignores_negative_processwide_delta():
+    """A per-model tracker must not retain process-wide reclaim evidence."""
+    tracker = PrefillTransientTracker()
+    ns = SimpleNamespace(
+        _prefill_min_chunk_tokens=256,
+        _prefill_transient_tracker=tracker,
+    )
+    ns._record_chunk_transient = Scheduler._record_chunk_transient.__get__(
+        ns, Scheduler
+    )
+
+    # This apparent release could have come from a concurrently scheduled
+    # model, so it must not become persistent state on this scheduler.
+    ns._record_chunk_transient(256, 1_000, 800, request_id="r", loop_label="unit")
+
+    assert tracker.samples == 0
+    assert tracker.last_delta_bytes == 0
+    assert not hasattr(tracker, "recent_reclaim_bytes")
+
+
 def test_record_chunk_transient_marks_floor_samples_only():
     """Only floor-size chunks may feed the observed max the admission
     charge uses; big-chunk transients stay EWMA-only."""

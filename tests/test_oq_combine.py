@@ -9,10 +9,13 @@ beyond a few small mx arrays.
 from __future__ import annotations
 
 import json
+import struct
+from pathlib import Path
 
 import mlx.core as mx
 import pytest
 
+import omlx.oq as oq
 from omlx.oq import (
     GEMMA4_ASSISTANT_MTP_PREFIX,
     GEMMA4_ASSISTANT_MTP_SHARD,
@@ -494,6 +497,159 @@ def _write_qwen_mtplx_sidecar_model(
     return out
 
 
+_TINY_SAFETENSORS_DTYPE_BYTES = {"BF16": 2, "F16": 2, "U32": 4}
+
+
+class _HeaderTensor:
+    """Header-only tensor stand-in used to keep importer tests CPU-only."""
+
+    def __init__(self, shape, nbytes, safetensors_dtype):
+        self.shape = tuple(shape)
+        self.nbytes = nbytes
+        self.safetensors_dtype = safetensors_dtype
+
+
+def _write_tiny_safetensors(path, tensors):
+    """Write a real, small safetensors file without materializing MLX arrays."""
+    header = {}
+    offset = 0
+    for name, (dtype, shape) in tensors.items():
+        nbytes = _TINY_SAFETENSORS_DTYPE_BYTES[dtype]
+        for dim in shape:
+            nbytes *= dim
+        header[name] = {
+            "dtype": dtype,
+            "shape": list(shape),
+            "data_offsets": [offset, offset + nbytes],
+        }
+        offset += nbytes
+    encoded = json.dumps(header).encode()
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + b"\0" * offset)
+
+
+def _read_tiny_safetensors_header(path):
+    with open(path, "rb") as f:
+        (header_size,) = struct.unpack("<Q", f.read(8))
+        return json.loads(f.read(header_size))
+
+
+def _header_only_mx_load(path):
+    """mx.load replacement that returns header shapes, never tensor data."""
+    header = _read_tiny_safetensors_header(path)
+    tensors = {}
+    for name, meta in header.items():
+        if name == "__metadata__":
+            continue
+        nbytes = _TINY_SAFETENSORS_DTYPE_BYTES[meta["dtype"]]
+        for dim in meta["shape"]:
+            nbytes *= dim
+        tensors[name] = _HeaderTensor(meta["shape"], nbytes, meta["dtype"])
+    return tensors
+
+
+def _header_only_mx_save_safetensors(path, tensors, metadata=None):
+    """mx.save_safetensors replacement for remapped header-only fixtures."""
+    del metadata
+    _write_tiny_safetensors(
+        Path(path),
+        {
+            name: (tensor.safetensors_dtype, tensor.shape)
+            for name, tensor in tensors.items()
+        },
+    )
+
+
+def _header_only_mx_eval(*tensors):
+    """Assert remap materialization stays in the header-only test harness."""
+    assert all(isinstance(tensor, _HeaderTensor) for tensor in tensors)
+
+
+def _write_cpu_only_quantized_mtplx_sidecar(
+    tmp_path,
+    *,
+    bits=8,
+    scales_shape=(12, 1),
+    weight_dtype="U32",
+):
+    """Tiny MTP sidecar: packed width 32 encodes 128 input features."""
+    out = tmp_path / "header-only-mtplx"
+    out.mkdir()
+    quant = {"group_size": 64, "bits": bits, "mode": "affine"}
+    config = {
+        "model_type": "qwen3_5",
+        "vision_config": {},
+        "text_config": {
+            "model_type": "qwen3_5_text",
+            "num_hidden_layers": 2,
+            **QWEN_GEOMETRY,
+        },
+        "quantization": dict(quant),
+        "quantization_config": dict(quant),
+    }
+    (out / "config.json").write_text(json.dumps(config))
+    (out / MTPLX_RUNTIME_FILE).write_text(json.dumps({"arch_id": "qwen3-next-mtp"}))
+
+    _write_tiny_safetensors(
+        out / "model-00001-of-00001.safetensors",
+        {"language_model.model.embed_tokens.weight": ("BF16", (2, 2))},
+    )
+    (out / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 8},
+                "weight_map": {
+                    "language_model.model.embed_tokens.weight": (
+                        "model-00001-of-00001.safetensors"
+                    )
+                },
+            }
+        )
+    )
+    _write_tiny_safetensors(
+        out / MTPLX_SIDECAR_SHARD,
+        {
+            "mtp.layers.0.self_attn.q_proj.weight": (weight_dtype, (12, 32)),
+            "mtp.layers.0.self_attn.q_proj.scales": ("F16", scales_shape),
+        },
+    )
+    return out
+
+
+def _write_old_imported_q8_g128_mtplx_sidecar(tmp_path):
+    """Mirror an old VLM import that indexed Q8/g128 as Q8/g64."""
+    out = _write_cpu_only_quantized_mtplx_sidecar(tmp_path)
+    module = "language_model.mtp.layers.0.self_attn.q_proj"
+
+    # The old importer had already remapped the VLM sidecar and updated the
+    # index, then wrote the trunk's Q8/g64 metadata for this Q8/g128 module.
+    _write_tiny_safetensors(
+        out / GEMMA4_ASSISTANT_MTP_SHARD,
+        {
+            module + ".weight": ("U32", (12, 32)),
+            module + ".scales": ("F16", (12, 1)),
+        },
+    )
+    (out / MTPLX_SIDECAR_SHARD).unlink()
+    index_path = out / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    index["weight_map"].update(
+        {
+            module + ".weight": GEMMA4_ASSISTANT_MTP_SHARD,
+            module + ".scales": GEMMA4_ASSISTANT_MTP_SHARD,
+        }
+    )
+    index_path.write_text(json.dumps(index))
+
+    config_path = out / "config.json"
+    config = json.loads(config_path.read_text())
+    config["text_config"]["mtp_num_hidden_layers"] = 1
+    wrong_entry = {"group_size": 64, "bits": 8, "mode": "affine"}
+    for section in ("quantization", "quantization_config"):
+        config[section][module] = dict(wrong_entry)
+    config_path.write_text(json.dumps(config))
+    return out
+
+
 def test_import_mtplx_sidecar_remaps_vlm_prefix(tmp_path):
     out = _write_qwen_mtplx_sidecar_model(tmp_path, vlm=True)
 
@@ -518,6 +674,124 @@ def test_import_mtplx_sidecar_remaps_vlm_prefix(tmp_path):
     # loaders stop reading the bare-key duplicate on every load.
     assert not (out / MTPLX_SIDECAR_SHARD).exists()
     assert (out / (MTPLX_SIDECAR_SHARD + ".orig")).exists()
+
+
+def test_import_mtplx_sidecar_infers_packed_group_size_from_header_fixture(
+    tmp_path, monkeypatch
+):
+    """The production importer must not copy the base global group size."""
+    out = _write_cpu_only_quantized_mtplx_sidecar(tmp_path)
+    monkeypatch.setattr(oq.mx, "load", _header_only_mx_load)
+    monkeypatch.setattr(oq.mx, "save_safetensors", _header_only_mx_save_safetensors)
+    monkeypatch.setattr(oq.mx, "eval", _header_only_mx_eval)
+
+    result = import_mtplx_sidecar(out)
+
+    assert result["merge_mode"] == "remap"
+    config = json.loads((out / "config.json").read_text())
+    module = "language_model.mtp.layers.0.self_attn.q_proj"
+    for section in ("quantization", "quantization_config"):
+        assert config[section]["group_size"] == 64
+        assert config[section]["bits"] == 8
+        assert config[section][module] == {
+            "group_size": 128,
+            "bits": 8,
+            "mode": "affine",
+        }
+
+    imported = _read_tiny_safetensors_header(out / GEMMA4_ASSISTANT_MTP_SHARD)
+    actual_scale_columns = imported[module + ".scales"]["shape"][1]
+    # Negative control: the old copy-global behavior predicts two columns
+    # for this packed Q8 weight, but the side-car physically has one.
+    old_global_columns = 32 * (32 // 8) // 64
+    assert old_global_columns == 2
+    assert actual_scale_columns == 1
+    assert old_global_columns != actual_scale_columns
+
+
+def test_import_mtplx_sidecar_repairs_old_imported_packed_group_metadata(
+    tmp_path, monkeypatch
+):
+    """An old imported Q8/g128 head must repair without rewriting its shard."""
+    out = _write_old_imported_q8_g128_mtplx_sidecar(tmp_path)
+    index_path = out / "model.safetensors.index.json"
+    shard_path = out / GEMMA4_ASSISTANT_MTP_SHARD
+    index_before = index_path.read_text()
+    shard_before = shard_path.read_bytes()
+    monkeypatch.setattr(oq.mx, "load", _header_only_mx_load)
+
+    result = import_mtplx_sidecar(out)
+
+    assert result == {"merge_mode": "metadata_repaired", "mtp_tensors": 2}
+    assert index_path.read_text() == index_before
+    assert shard_path.read_bytes() == shard_before
+    config = json.loads((out / "config.json").read_text())
+    module = "language_model.mtp.layers.0.self_attn.q_proj"
+    for section in ("quantization", "quantization_config"):
+        assert config[section]["group_size"] == 64
+        assert config[section][module] == {
+            "group_size": 128,
+            "bits": 8,
+            "mode": "affine",
+        }
+
+
+def test_import_mtplx_sidecar_rejects_non_u32_packed_weight_before_mutation(
+    tmp_path, monkeypatch
+):
+    out = _write_cpu_only_quantized_mtplx_sidecar(tmp_path, weight_dtype="F16")
+    config_before = (out / "config.json").read_text()
+    index_before = (out / "model.safetensors.index.json").read_text()
+    sidecar_before = (out / MTPLX_SIDECAR_SHARD).read_bytes()
+    monkeypatch.setattr(oq.mx, "load", _header_only_mx_load)
+
+    with pytest.raises(
+        ValueError, match="only word-aligned U32 Q4/Q8 packed weights"
+    ):
+        import_mtplx_sidecar(out)
+
+    assert (out / MTPLX_SIDECAR_SHARD).read_bytes() == sidecar_before
+    assert not (out / GEMMA4_ASSISTANT_MTP_SHARD).exists()
+    assert (out / "config.json").read_text() == config_before
+    assert (out / "model.safetensors.index.json").read_text() == index_before
+
+
+def test_import_mtplx_sidecar_rejects_nonintegral_packed_scale_groups(
+    tmp_path, monkeypatch
+):
+    out = _write_cpu_only_quantized_mtplx_sidecar(tmp_path, scales_shape=(12, 3))
+    config_before = (out / "config.json").read_text()
+    index_before = (out / "model.safetensors.index.json").read_text()
+    monkeypatch.setattr(oq.mx, "load", _header_only_mx_load)
+
+    with pytest.raises(
+        ValueError, match="Cannot infer exact MTPLX quantization group_size"
+    ):
+        import_mtplx_sidecar(out)
+
+    assert (out / MTPLX_SIDECAR_SHARD).exists()
+    assert not (out / GEMMA4_ASSISTANT_MTP_SHARD).exists()
+    assert (out / "config.json").read_text() == config_before
+    assert (out / "model.safetensors.index.json").read_text() == index_before
+
+
+def test_import_mtplx_sidecar_rejects_non_word_aligned_packed_bits(
+    tmp_path, monkeypatch
+):
+    out = _write_cpu_only_quantized_mtplx_sidecar(tmp_path, bits=6)
+    config_before = (out / "config.json").read_text()
+    index_before = (out / "model.safetensors.index.json").read_text()
+    monkeypatch.setattr(oq.mx, "load", _header_only_mx_load)
+
+    with pytest.raises(
+        ValueError, match="only word-aligned U32 Q4/Q8 packed weights"
+    ):
+        import_mtplx_sidecar(out)
+
+    assert (out / MTPLX_SIDECAR_SHARD).exists()
+    assert not (out / GEMMA4_ASSISTANT_MTP_SHARD).exists()
+    assert (out / "config.json").read_text() == config_before
+    assert (out / "model.safetensors.index.json").read_text() == index_before
 
 
 def test_import_mtplx_sidecar_renames_when_keys_align(tmp_path):
@@ -595,4 +869,3 @@ def test_import_mtplx_sidecar_rejects_failed_audit(tmp_path):
 
     with pytest.raises(ValueError, match="payload_audit"):
         import_mtplx_sidecar(out)
-

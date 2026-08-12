@@ -1406,8 +1406,15 @@ def _synthesize_mtp_quant_entries(
     mtp_key_shards: dict,
     *,
     recipient_prefix: str,
+    tensor_values: Optional[dict] = None,
 ) -> dict:
-    """Build per-layer quant entries for modules with explicit ``.scales``."""
+    """Build per-layer quant entries for modules with explicit ``.scales``.
+
+    When the source tensor values are available, derive each packed module's
+    group size from its physical ``weight`` and ``scales`` shapes. The side-car
+    layout is authoritative here: a base checkpoint's global quantization
+    settings may not describe an independently quantized MTP head.
+    """
     if not isinstance(donor_quant, dict):
         return {}
     donor_global = {
@@ -1441,8 +1448,79 @@ def _synthesize_mtp_quant_entries(
                     "global quantization parameters"
                 )
             spec = donor_global
-        quant_entries[recipient_prefix + bare_module] = dict(spec)
+        entry = dict(spec)
+        if tensor_values is not None:
+            weight = tensor_values.get(base + ".weight")
+            if weight is None:
+                raise ValueError(
+                    f"MTPLX side-car has {key} but no matching {base}.weight; "
+                    "refusing to import a malformed quantized module"
+                )
+            entry["group_size"] = _infer_packed_mtp_group_size(
+                base,
+                weight,
+                tensor_values[key],
+                entry.get("bits"),
+            )
+        quant_entries[recipient_prefix + bare_module] = entry
     return quant_entries
+
+
+def _infer_packed_mtp_group_size(
+    module: str,
+    weight,
+    scales,
+    bits: object,
+) -> int:
+    """Infer a packed MTP linear's group size, rejecting ambiguous layouts."""
+    weight_shape = tuple(getattr(weight, "shape", ()))
+    scales_shape = tuple(getattr(scales, "shape", ()))
+    header_dtype = getattr(weight, "safetensors_dtype", None)
+    runtime_dtype = getattr(weight, "dtype", None)
+    if header_dtype is not None:
+        is_u32 = header_dtype == "U32" and (
+            runtime_dtype is None or runtime_dtype == mx.uint32
+        )
+    else:
+        is_u32 = runtime_dtype == mx.uint32
+    if (
+        type(bits) is not int
+        or bits not in (4, 8)
+        or not is_u32
+        or len(weight_shape) != 2
+        or len(scales_shape) != 2
+        or weight_shape[0] != scales_shape[0]
+        or scales_shape[1] <= 0
+    ):
+        raise ValueError(
+            "Cannot infer exact MTPLX quantization group_size for "
+            f"{module}: weight shape {weight_shape}, scales shape {scales_shape}, "
+            f"bits={bits!r}; only word-aligned U32 Q4/Q8 packed weights are "
+            "supported, refusing to import an invalid side-car"
+        )
+
+    input_features = weight_shape[1] * (32 // bits)
+    if input_features <= 0 or input_features % scales_shape[1]:
+        raise ValueError(
+            "Cannot infer exact MTPLX quantization group_size for "
+            f"{module}: weight shape {weight_shape}, scales shape {scales_shape}, "
+            f"bits={bits}; refusing to import an invalid side-car"
+        )
+    return input_features // scales_shape[1]
+
+
+def _merge_mtp_quant_entries(config: dict, quant_entries: dict) -> bool:
+    """Merge MTP module metadata, returning whether the config changed."""
+    changed = False
+    for section in ("quantization", "quantization_config"):
+        section_cfg = config.get(section)
+        if not isinstance(section_cfg, dict):
+            continue
+        for module, entry in quant_entries.items():
+            if section_cfg.get(module) != entry:
+                section_cfg[module] = entry
+                changed = True
+    return changed
 
 
 def _resolve_mtplx_sidecar(model_path: Path, config: dict) -> Optional[Path]:
@@ -1504,7 +1582,8 @@ def import_mtplx_sidecar(model_path: Union[str, Path]) -> dict:
     the stock mlx-lm/mlx-vlm weight globs and the index-based MTP detection
     see the head with no load-time special casing. mlx_lm only ever opens
     ``model*.safetensors``, which is why pointing the index at the original
-    side-car name is not enough. Idempotent: re-running is a no-op.
+    side-car name is not enough. Re-running is a no-op after reconciling
+    metadata produced by older importer versions.
     """
     output = Path(model_path)
     with open(output / "config.json") as f:
@@ -1535,14 +1614,40 @@ def import_mtplx_sidecar(model_path: Union[str, Path]) -> dict:
     if not mtp_weights:
         raise ValueError(f"No mtp.* tensors found in side-car: {sidecar}")
 
+    # Infer and validate quantization before renaming or writing anything.
+    # The base checkpoint's global group_size can differ from the separately
+    # quantized MTP side-car, which would otherwise produce an unloadable
+    # checkpoint after the import succeeds.
+    donor_quant = (
+        config.get("mtplx_mtp_quantization") or config.get("quantization") or {}
+    )
+    quant_entries = _synthesize_mtp_quant_entries(
+        donor_quant,
+        {k: GEMMA4_ASSISTANT_MTP_SHARD for k in sidecar_weights},
+        recipient_prefix=recipient_prefix,
+        tensor_values=sidecar_weights,
+    )
+
     # Idempotency: the index (not the header fallback of _shard_key_map,
     # which would see the not-yet-imported side-car itself) is what the MTP
-    # weight detection reads, so it is the import-completed marker.
+    # weight detection reads, so it is the import-completed marker. Reconcile
+    # metadata before returning, because older imports copied the trunk's
+    # global group size onto independently packed MTP side-cars.
     index_path = output / "model.safetensors.index.json"
     if index_path.exists():
         with open(index_path) as f:
             indexed = json.load(f).get("weight_map") or {}
         if all(key in indexed for key in mtp_weights):
+            if _merge_mtp_quant_entries(config, quant_entries):
+                _atomic_write_json(output / "config.json", config)
+                logger.info(
+                    "Repaired MTPLX side-car quantization metadata in %s",
+                    output.name,
+                )
+                return {
+                    "merge_mode": "metadata_repaired",
+                    "mtp_tensors": len(mtp_weights),
+                }
             logger.info("MTPLX side-car already imported into %s", output.name)
             return {"merge_mode": "noop", "mtp_tensors": len(mtp_weights)}
 
@@ -1566,19 +1671,7 @@ def import_mtplx_sidecar(model_path: Union[str, Path]) -> dict:
             # glob; sub-directory side-cars are invisible to it already.
             sidecar.replace(sidecar.with_name(sidecar.name + ".orig"))
 
-    donor_quant = (
-        config.get("mtplx_mtp_quantization") or config.get("quantization") or {}
-    )
-    quant_entries = _synthesize_mtp_quant_entries(
-        donor_quant,
-        {k: GEMMA4_ASSISTANT_MTP_SHARD for k in sidecar_weights},
-        recipient_prefix=recipient_prefix,
-    )
-    if quant_entries:
-        for section in ("quantization", "quantization_config"):
-            section_cfg = config.get(section)
-            if isinstance(section_cfg, dict):
-                section_cfg.update(quant_entries)
+    _merge_mtp_quant_entries(config, quant_entries)
 
     scope = _mtp_text_scope(config)
     scope["mtp_num_hidden_layers"] = max(_mtp_declared_layers(config), 1)

@@ -254,6 +254,7 @@ class TestProfileRoutes:
                     "turboquant_kv_enabled": True,
                     "specprefill_enabled": True,
                     "dflash_enabled": True,
+                    "dflash_copyspec_mode": "auto",
                     "mtp_enabled": True,
                     "vlm_mtp_enabled": True,
                     "chat_template_kwargs": {
@@ -278,6 +279,7 @@ class TestProfileRoutes:
         assert settings["turboquant_kv_enabled"] is False
         assert settings["specprefill_enabled"] is False
         assert settings["dflash_enabled"] is False
+        assert "dflash_copyspec_mode" not in settings
         assert settings["mtp_enabled"] is False
         assert settings["vlm_mtp_enabled"] is False
         assert settings["chat_template_kwargs"] == {"custom_key": "ok"}
@@ -588,6 +590,7 @@ class TestModelsResponseActiveProfile:
                 "turboquant_kv_enabled": True,
                 "specprefill_enabled": True,
                 "dflash_enabled": True,
+                "dflash_copyspec_mode": "auto",
                 "dflash_in_memory_cache": False,
                 "dflash_ssd_cache": True,
                 "mtp_enabled": True,
@@ -608,6 +611,7 @@ class TestModelsResponseActiveProfile:
         assert settings["turboquant_kv_enabled"] is False
         assert settings["specprefill_enabled"] is False
         assert settings["dflash_enabled"] is False
+        assert "dflash_copyspec_mode" not in settings
         assert settings["dflash_in_memory_cache"] is True
         assert settings["dflash_ssd_cache"] is False
         assert settings["mtp_enabled"] is False

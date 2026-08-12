@@ -28,6 +28,7 @@ from ..adapter.output_parser import detect_output_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.observability import CacheRateTracker
+from ..dflash_runtime import normalize_dflash_copyspec_mode, with_optional_copyspec_mode
 from ..memory_monitor import (
     MemoryMonitor,
     raise_if_prefill_exceeds,
@@ -387,7 +388,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
             if model_settings
             else 20 * 1024**3
         )
-        # None → let dflash-mlx pick its own default (window=1024, sink=64, verify="adaptive").
+        # None → let dflash-mlx pick its own default (window=1024, sink=64,
+        # verify="adaptive", copyspec="conservative").
         # `getattr` returns None for missing attrs so older settings files keep working.
         self._draft_window_size = (
             getattr(model_settings, "dflash_draft_window_size", None)
@@ -401,6 +403,11 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         )
         self._verify_mode = (
             getattr(model_settings, "dflash_verify_mode", None)
+            if model_settings
+            else None
+        )
+        self._copyspec_mode = normalize_dflash_copyspec_mode(
+            getattr(model_settings, "dflash_copyspec_mode", None)
             if model_settings
             else None
         )
@@ -463,20 +470,29 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
 
         l2_dir = self._resolve_dflash_l2_dir()
         l2_enabled = l2_dir is not None
-        cfg = runtime_config_from_defaults(
-            prefix_cache=self._in_memory_cache_enabled,
-            prefix_cache_max_entries=self._in_memory_cache_max_entries,
-            prefix_cache_max_bytes=self._in_memory_cache_max_bytes,
-            prefix_cache_l2=l2_enabled,
-            prefix_cache_l2_dir=str(l2_dir) if l2_dir else "",
+        runtime_config_kwargs = {
+            "prefix_cache": self._in_memory_cache_enabled,
+            "prefix_cache_max_entries": self._in_memory_cache_max_entries,
+            "prefix_cache_max_bytes": self._in_memory_cache_max_bytes,
+            "prefix_cache_l2": l2_enabled,
+            "prefix_cache_l2_dir": str(l2_dir) if l2_dir else "",
             # Per-model L2 disk budget. dflash-mlx's _evict_to_budget drops the
             # oldest snapshots once dflash_l2/ exceeds this, so the directory
             # stays bounded instead of filling the disk (issue #1326).
-            prefix_cache_l2_max_bytes=self._ssd_cache_max_bytes if l2_enabled else 0,
+            "prefix_cache_l2_max_bytes": self._ssd_cache_max_bytes
+            if l2_enabled
+            else 0,
             # None → dflash-mlx fills in DEFAULT_RUNTIME_CONFIG values.
-            draft_window_size=self._draft_window_size,
-            draft_sink_size=self._draft_sink_size,
-            verify_mode=self._verify_mode,
+            "draft_window_size": self._draft_window_size,
+            "draft_sink_size": self._draft_sink_size,
+            "verify_mode": self._verify_mode,
+        }
+        cfg = runtime_config_from_defaults(
+            **with_optional_copyspec_mode(
+                runtime_config_from_defaults,
+                runtime_config_kwargs,
+                self._copyspec_mode,
+            )
         )
         return build_runtime_context(cfg)
 

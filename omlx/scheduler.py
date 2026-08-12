@@ -4230,6 +4230,12 @@ class Scheduler:
         has to stay conservative. Keeping kv_len in the log is what made that
         analysis possible.
 
+        Negative deltas remain excluded. ``phys_footprint`` is process-wide,
+        whereas this tracker belongs to one model scheduler; retaining a
+        release here would charge one model for another scheduler's allocator
+        activity. Reclaim-aware admission needs process-global accounting or
+        an ownership signal, neither of which this measurement provides.
+
         Under speed priority, only a complete requested step is representative
         of the full-size chunks used for admission. A shorter tail or
         boundary-alignment chunk must not replace the last full-step sample:

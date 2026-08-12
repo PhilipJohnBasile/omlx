@@ -13,14 +13,15 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from .dflash_runtime import normalize_dflash_copyspec_mode
 from .model_profiles import (
     MODEL_SPECIFIC_PROFILE_FIELDS,
     UNIVERSAL_FIELDS_SET,
     filter_profile_fields,
     filter_universal_fields,
     slugify_profile_api_name,
-    validate_profile_name,
     utcnow,
+    validate_profile_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -132,6 +133,8 @@ class ModelSettings:
         dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
             (None = dflash default "adaptive"). "adaptive" can shrink block size when
             acceptance drops.
+        dflash_copyspec_mode: Prompt-lookup drafting policy — "conservative", "auto", or
+            "off" (None = dflash default "conservative").
         mtp_enabled: Enable native multi-token prediction (mlx-lm PR 990 / PR 15 monkey-patch).
             When True, BatchGenerator uses MTP draft+verify for singleton decode and
             for multi-row decode batches whose cache positions are aligned. Unaligned
@@ -231,11 +234,13 @@ class ModelSettings:
     )
     dflash_ssd_cache_max_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GiB L2 disk budget
     # DFlash runtime tuning knobs. None = let dflash-mlx pick its own DEFAULT_RUNTIME_CONFIG
-    # value (currently window=1024, sink=64, verify_mode="adaptive"). Surfaced for long-context
-    # agentic workloads where acceptance drops on the default sliding window.
+    # value (currently window=1024, sink=64, verify_mode="adaptive", and
+    # copyspec_mode="conservative"). Surfaced for long-context agentic workloads
+    # where acceptance drops on the default sliding window.
     dflash_draft_window_size: Optional[int] = None
     dflash_draft_sink_size: Optional[int] = None
     dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
+    dflash_copyspec_mode: Optional[str] = None  # "conservative" | "auto" | "off"
 
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch). When enabled, BatchGenerator
     # uses MTP draft+verify for singleton decode and aligned multi-row decode batches.
@@ -280,6 +285,13 @@ class ModelSettings:
     active_profile_name: Optional[str] = None  # Name of the currently-applied profile
 
     def __post_init__(self) -> None:
+        # Settings can enter through persisted JSON, profiles, or callers that
+        # construct ModelSettings directly. Normalize once at this shared
+        # boundary so an unsupported DFlash value cannot survive until engine
+        # construction.
+        self.dflash_copyspec_mode = normalize_dflash_copyspec_mode(
+            self.dflash_copyspec_mode
+        )
         # Native MTP is mutually exclusive with DFlash (also speculative).
         # Reject the combo at construction time so the conflict surfaces in
         # the admin UI / API rather than at model load. TurboQuant KV is

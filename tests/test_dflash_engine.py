@@ -617,6 +617,7 @@ class TestDFlashEngineInit:
         assert engine._draft_window_size is None
         assert engine._draft_sink_size is None
         assert engine._verify_mode is None
+        assert engine._copyspec_mode is None
 
     def test_long_context_knobs_read_from_settings(self):
         """Issue #1276 — DFlashEngine picks up window/sink/verify_mode from ModelSettings."""
@@ -632,11 +633,13 @@ class TestDFlashEngineInit:
                 dflash_draft_window_size=2048,
                 dflash_draft_sink_size=32,
                 dflash_verify_mode="adaptive",
+                dflash_copyspec_mode="auto",
             ),
         )
         assert engine._draft_window_size == 2048
         assert engine._draft_sink_size == 32
         assert engine._verify_mode == "adaptive"
+        assert engine._copyspec_mode == "auto"
 
     def test_build_runtime_context_passes_knobs(self):
         """The new kwargs reach dflash-mlx and end up in RuntimeContext.runtime."""
@@ -652,6 +655,7 @@ class TestDFlashEngineInit:
                 dflash_draft_window_size=512,
                 dflash_draft_sink_size=16,
                 dflash_verify_mode="dflash",
+                dflash_copyspec_mode="auto",
             ),
         )
         ctx = engine._build_runtime_context()
@@ -659,6 +663,7 @@ class TestDFlashEngineInit:
         assert runtime.draft_window_size == 512
         assert runtime.draft_sink_size == 16
         assert runtime.verify_mode == "dflash"
+        assert runtime.copyspec_mode == "auto"
 
     def test_build_runtime_context_defaults_to_dflash_mlx_values(self):
         """None settings → dflash-mlx fills DEFAULT_RUNTIME_CONFIG (1024 / 64 / 'adaptive')."""

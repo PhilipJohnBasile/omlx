@@ -10,6 +10,11 @@ def _model_settings_template() -> str:
     ).read_text()
 
 
+def _dashboard_js() -> str:
+    root = Path(__file__).resolve().parents[1]
+    return (root / "omlx/admin/static/js/dashboard.js").read_text()
+
+
 def _section(html: str, start_marker: str, end_marker: str) -> str:
     return html.split(start_marker, 1)[1].split(end_marker, 1)[0]
 
@@ -52,3 +57,19 @@ def test_reasoning_effort_offers_max_after_high():
     assert high_option in html
     assert max_option in html
     assert html.index(high_option) < html.index(max_option)
+
+
+def test_dflash_copyspec_mode_has_all_runtime_options():
+    html = _model_settings_template()
+
+    assert 'x-model="modelSettings.dflash_copyspec_mode"' in html
+    assert '<option value="conservative">conservative (default)</option>' in html
+    assert '<option value="auto">auto</option>' in html
+    assert '<option value="off">off</option>' in html
+
+
+def test_dflash_copyspec_mode_uses_and_submits_the_conservative_default():
+    dashboard = _dashboard_js()
+
+    assert "dflash_copyspec_mode: s.dflash_copyspec_mode || 'conservative'" in dashboard
+    assert "? (this.modelSettings.dflash_copyspec_mode || 'conservative')" in dashboard
